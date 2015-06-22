@@ -2,10 +2,13 @@ use {Event, BuilderAttribs, MouseCursor};
 use CreationError;
 use CreationError::OsError;
 use libc;
+use std::borrow::Borrow;
 use std::{mem, ptr};
 use std::cell::Cell;
+use std::ffi::CString;
 use std::sync::atomic::AtomicBool;
 use std::collections::VecDeque;
+use std::slice::from_raw_parts;
 use std::sync::{Arc, Mutex};
 
 use Api;
@@ -106,8 +109,64 @@ impl WindowProxy {
     }
 }
 
+struct XGenericEventCookie<'a> {
+    display: &'a XConnection,
+    cookie: ffi::XGenericEventCookie
+}
+
+impl<'a> XGenericEventCookie<'a> {
+    fn from_event<'b>(display: &'b XConnection, event: ffi::XEvent) -> Option<XGenericEventCookie<'b>> {
+        unsafe {
+            let mut cookie: ffi::XGenericEventCookie = From::from(event);
+            if (display.xlib.XGetEventData)(display.display, &mut cookie) == ffi::True {
+                Some(XGenericEventCookie{display: display, cookie: cookie})
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl<'a> Drop for XGenericEventCookie<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            let xlib = &self.display.xlib;
+            (xlib.XFreeEventData)(self.display.display, &mut self.cookie);
+        }
+    }
+}
+
 pub struct PollEventsIterator<'a> {
-    window: &'a Window,
+    window: &'a Window
+}
+
+impl<'a> PollEventsIterator<'a> {
+    fn process_generic_event(&mut self, event: &ffi::XEvent) {
+        if let Some(cookie) = XGenericEventCookie::from_event(self.window.x.display.borrow(), *event) {
+            match cookie.cookie.evtype {
+                ffi::XI_Motion => {
+                    use events::Event::{MouseWheel};
+                    use events::MouseScrollDelta::{PixelDelta};
+
+                    let event_data: &ffi::XIDeviceEvent = unsafe { mem::transmute(cookie.cookie.data) };
+                    let axis_state = event_data.valuators;
+                    let mask = unsafe { from_raw_parts(axis_state.mask, axis_state.mask_len as usize) };
+
+                    let mut axis_values: Vec<(i32,f32)> = Vec::new();
+                    for axis_id in 0..axis_state.mask_len {
+                        if ffi::XIMaskIsSet(&mask, axis_id) {
+                            let axis_value = unsafe { *axis_state.values.offset(axis_values.len() as isize) };
+                            axis_values.push((axis_id, axis_value as f32));
+                        }
+                    }
+
+                    let delta = PixelDelta(0.0, 0.0);
+                    self.window.pending_events.lock().unwrap().push_back(MouseWheel(delta));
+                },
+                _ => {}
+            }
+        }
+    }
 }
 
 impl<'a> Iterator for PollEventsIterator<'a> {
@@ -126,7 +185,10 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                 let res = unsafe { (self.window.x.display.xlib.XCheckTypedEvent)(self.window.x.display.display, ffi::ClientMessage, &mut xev) };
 
                 if res == 0 {
-                    return None;
+                    let res = unsafe { (self.window.x.display.xlib.XCheckTypedEvent)(self.window.x.display.display, ffi::GenericEvent, &mut xev) };
+                    if res == 0 {
+                        return None;
+                    }
                 }
             }
 
@@ -221,7 +283,7 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                     use events::ElementState::{Pressed, Released};
                     use events::MouseButton::{Left, Right, Middle};
                     use events::MouseScrollDelta::{LineDelta};
-
+                    
                     let event: &ffi::XButtonEvent = unsafe { mem::transmute(&xev) };
 
                     let state = if xev.get_type() == ffi::ButtonPress { Pressed } else { Released };
@@ -250,7 +312,9 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                     };
                 },
 
-                _ => ()
+                ffi::GenericEvent => { self.process_generic_event(&mut xev); }
+
+                _ => {}
             };
         }
     }
@@ -528,6 +592,8 @@ impl Window {
             ic
         };
 
+        Self::init_xinput(display, window);
+
         // Attempt to make keyboard input repeat detectable
         unsafe {
             let mut supported_ptr = ffi::False;
@@ -793,6 +859,47 @@ impl Window {
         }
 
         Ok(())
+    }
+
+    fn init_xinput(display: &Arc<XConnection>, window: ffi::Window) {
+        // query XInput support
+        let mut opcode: libc::c_int = 0;
+        let mut event: libc::c_int = 0;
+        let mut error: libc::c_int = 0;
+        let xinput_str = CString::new("XInputExtension").unwrap();
+
+        unsafe {
+            if (display.xlib.XQueryExtension)(display.display, xinput_str.as_ptr(), &mut opcode, &mut event, &mut error) == ffi::False {
+                panic!("XInput not available")
+            }
+        }
+
+        let mut xinput_major_ver = ffi::XI_2_Major;
+        let mut xinput_minor_ver = ffi::XI_2_Minor;
+
+        unsafe {
+            if (display.xinput2.XIQueryVersion)(display.display, &mut xinput_major_ver, &mut xinput_minor_ver) != ffi::Success as libc::c_int {
+                panic!("ffi not available");
+            }
+        }
+
+        // init XInput events
+        let mut mask: [libc::c_uchar; 1] = [0];
+        let mut input_event_mask = ffi::XIEventMask {
+            deviceid: ffi::XIAllDevices,
+            mask_len: mask.len() as i32,
+            mask: mask.as_mut_ptr()
+        };
+        ffi::XISetMask(&mut mask, ffi::XI_ButtonPress);
+        ffi::XISetMask(&mut mask, ffi::XI_Motion);
+        ffi::XISetMask(&mut mask, ffi::XI_KeyPress);
+
+        unsafe {
+            match (display.xinput2.XISelectEvents)(display.display, window, &mut input_event_mask, 1) {
+                status if status as u8 == ffi::Success => (),
+                err => panic!("Failed to select events {:?}", err)
+            }
+        }
     }
 }
 
